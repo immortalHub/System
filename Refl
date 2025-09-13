@@ -1,0 +1,11 @@
+Problems:
+• Performance: Reflection involves metadata inspection and late binding, which is significantly slower than compile-time, static binding. Using it in a tight loop (e.g., processing each item in a large collection) can be a major performance bottleneck.
+• Security: Reflection can bypass access modifiers (like accessing private members), which breaks encapsulation. This requires high-trust permissions and can be a security risk if misused, as it exposes internal implementation details.
+• Maintainability: Code that uses reflection is often harder to read, debug, and refactor. Refactoring a name (e.g., a property) might break string-based reflection calls that the compiler cannot catch.
+Alternative Solutions:
+• For Object Creation/Dependency Injection: Use a Dependency Injection (DI) Container (like the one built into ASP.NET Core). They use reflection internally but are highly optimized and cached.
+• For Accessing Properties/Methods Dynamically:
+• Use Interfaces or Abstract Classes: Design your code to work against known interfaces, avoiding the need to discover types at runtime.
+• Use the dynamic keyword: For truly dynamic scenarios, dynamic can be faster than reflection after the first call due to caching, but it's still not as fast as static code.
+• Use Compiler-generated Expression Trees: For building dynamic queries (e.g., in ORMs), this is a powerful and more performant alternative.
+• Use Source Generators (.NET 5+): This is the modern, high-performance alternative. Source Generators run during compilation and generate static C# code based on analysis of your program. This eliminates the runtime cost of reflection entirely. For example, instead of using reflection to map objects, a source generator can create the mapping code at compile time.
