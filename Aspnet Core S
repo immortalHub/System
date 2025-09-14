@@ -1,0 +1,1106 @@
+Of course. Here are 10 C# ASP.NET Core security challenges, ranging from intermediate to advanced levels, each with a problem explanation and a detailed solution.
+
+---
+
+### Challenge 1: Secure JWT Authentication & Authorization
+
+**Problem:** Implement a robust JWT-based authentication system that is resistant to common threats. The solution must include secure token generation, validation, role-based authorization, and protection against token theft and replay attacks.
+
+**Solution:**
+
+```csharp
+// 1. JWT Service for secure token handling
+public interface IJwtService
+{
+    string GenerateToken(User user);
+    ClaimsPrincipal? ValidateToken(string token);
+}
+
+public class JwtService : IJwtService
+{
+    private readonly byte[] _secretKey;
+    private readonly string _issuer;
+    private readonly string _audience;
+
+    public JwtService(IConfiguration configuration)
+    {
+        // Use a sufficiently long secret key (at least 256 bits)
+        _secretKey = Encoding.UTF8.GetBytes(configuration["Jwt:SecretKey"]!);
+        _issuer = configuration["Jwt:Issuer"]!;
+        _audience = configuration["Jwt:Audience"]!;
+    }
+
+    public string GenerateToken(User user)
+    {
+        var tokenHandler = new JwtSecurityTokenHandler();
+        var tokenDescriptor = new SecurityTokenDescriptor
+        {
+            Subject = new ClaimsIdentity(new[]
+            {
+                new Claim(ClaimTypes.NameIdentifier, user.Id.ToString()),
+                new Claim(ClaimTypes.Name, user.UserName),
+                new Claim(ClaimTypes.Email, user.Email),
+                new Claim(ClaimTypes.Role, user.Role),
+                // Custom claims
+                new Claim("jti", Guid.NewGuid().ToString()) // Unique token ID for replay protection
+            }),
+            Expires = DateTime.UtcNow.AddMinutes(15), // Short-lived access token
+            Issuer = _issuer,
+            Audience = _audience,
+            SigningCredentials = new SigningCredentials(
+                new SymmetricSecurityKey(_secretKey),
+                SecurityAlgorithms.HmacSha256Signature)
+        };
+
+        var token = tokenHandler.CreateToken(tokenDescriptor);
+        return tokenHandler.WriteToken(token);
+    }
+
+    public ClaimsPrincipal? ValidateToken(string token)
+    {
+        var tokenHandler = new JwtSecurityTokenHandler();
+        try
+        {
+            var validationParameters = new TokenValidationParameters
+            {
+                ValidateIssuerSigningKey = true,
+                IssuerSigningKey = new SymmetricSecurityKey(_secretKey),
+                ValidateIssuer = true,
+                ValidIssuer = _issuer,
+                ValidateAudience = true,
+                ValidAudience = _audience,
+                ValidateLifetime = true,
+                ClockSkew = TimeSpan.Zero // Strict expiration validation
+            };
+
+            return tokenHandler.ValidateToken(token, validationParameters, out _);
+        }
+        catch
+        {
+            return null;
+        }
+    }
+}
+
+// 2. Custom Authorization Attribute for specific roles
+public class AuthorizeRolesAttribute : AuthorizeAttribute
+{
+    public AuthorizeRolesAttribute(params string[] roles)
+    {
+        Roles = string.Join(",", roles);
+    }
+}
+
+// 3. Controller Usage
+[ApiController]
+[Route("api/[controller]")]
+public class AdminController : ControllerBase
+{
+    [HttpGet("secure-data")]
+    [AuthorizeRoles("Admin", "SuperAdmin")] // Custom attribute
+    public IActionResult GetSecureData()
+    {
+        return Ok(new { Message = "Sensitive admin data" });
+    }
+
+    [HttpGet("user-profile")]
+    [Authorize] // Standard authorization
+    public IActionResult GetUserProfile()
+    {
+        var userId = User.FindFirst(ClaimTypes.NameIdentifier)?.Value;
+        return Ok(new { UserId = userId, Profile = "User data" });
+    }
+}
+
+// 4. Program.cs Configuration
+public void ConfigureServices(IServiceCollection services)
+{
+    // Add JWT Authentication
+    services.AddAuthentication(JwtBearerDefaults.AuthenticationScheme)
+        .AddJwtBearer(options =>
+        {
+            options.TokenValidationParameters = new TokenValidationParameters
+            {
+                ValidateIssuerSigningKey = true,
+                IssuerSigningKey = new SymmetricSecurityKey(
+                    Encoding.UTF8.GetBytes(Configuration["Jwt:SecretKey"]!)),
+                ValidateIssuer = true,
+                ValidIssuer = Configuration["Jwt:Issuer"],
+                ValidateAudience = true,
+                ValidAudience = Configuration["Jwt:Audience"],
+                ValidateLifetime = true,
+                ClockSkew = TimeSpan.Zero
+            };
+        });
+
+    services.AddAuthorization(options =>
+    {
+        options.AddPolicy("RequireAdmin", policy => 
+            policy.RequireRole("Admin", "SuperAdmin"));
+    });
+
+    services.AddScoped<IJwtService, JwtService>();
+}
+```
+
+---
+
+### Challenge 2: Protection Against SQL Injection
+
+**Problem:** Prevent SQL injection attacks by ensuring user input is never directly interpolated into SQL queries. Use parameterized queries and ORM features correctly.
+
+**Solution:**
+
+```csharp
+// UNSAFE - VULNERABLE CODE
+public class VulnerableUserRepository
+{
+    public User GetUserByUsername(string username)
+    {
+        using var connection = new SqlConnection("ConnectionString");
+        // 🚨 VULNERABLE: String concatenation leads to SQL injection
+        var query = $"SELECT * FROM Users WHERE Username = '{username}'";
+        return connection.QueryFirstOrDefault<User>(query);
+    }
+}
+
+// SAFE - SECURE SOLUTION
+public class SecureUserRepository
+{
+    private readonly AppDbContext _context;
+
+    public SecureUserRepository(AppDbContext context)
+    {
+        _context = context;
+    }
+
+    // Method 1: Using Entity Framework Core (parameterized by default)
+    public async Task<User?> GetUserByUsernameAsync(string username)
+    {
+        // EF Core uses parameterized queries automatically
+        return await _context.Users
+            .FirstOrDefaultAsync(u => u.Username == username);
+    }
+
+    // Method 2: Using Dapper with explicit parameters
+    public User GetUserByUsernameDapper(string username)
+    {
+        using var connection = new SqlConnection("ConnectionString");
+        var query = "SELECT * FROM Users WHERE Username = @Username";
+        
+        // Parameterized query prevents SQL injection
+        return connection.QueryFirstOrDefault<User>(query, new { Username = username });
+    }
+
+    // Method 3: Using stored procedures
+    public User GetUserByUsernameStoredProc(string username)
+    {
+        using var connection = new SqlConnection("ConnectionString");
+        return connection.QueryFirstOrDefault<User>(
+            "sp_GetUserByUsername",
+            new { Username = username },
+            commandType: CommandType.StoredProcedure);
+    }
+}
+
+// Additional protection: Input validation
+public class UserController : ControllerBase
+{
+    private readonly SecureUserRepository _repository;
+
+    [HttpGet("user/{username}")]
+    public async Task<IActionResult> GetUser(string username)
+    {
+        // Validate input before processing
+        if (string.IsNullOrWhiteSpace(username) || username.Length > 50)
+        {
+            return BadRequest("Invalid username");
+        }
+
+        // Check for potentially dangerous characters (defense in depth)
+        if (username.Contains("'") || username.Contains(";") || username.Contains("--"))
+        {
+            return BadRequest("Invalid characters in username");
+        }
+
+        var user = await _repository.GetUserByUsernameAsync(username);
+        return user != null ? Ok(user) : NotFound();
+    }
+}
+```
+
+---
+
+### Challenge 3: Cross-Site Request Forgery (CSRF) Protection
+
+**Problem:** Protect your application from CSRF attacks where malicious websites trick authenticated users into performing unwanted actions.
+
+**Solution:**
+
+```csharp
+// 1. Configure Anti-Forgery in Program.cs
+public void ConfigureServices(IServiceCollection services)
+{
+    services.AddAntiforgery(options =>
+    {
+        options.HeaderName = "X-XSRF-TOKEN"; // Common header name for AJAX requests
+        options.Cookie.Name = "XSRF-TOKEN";
+        options.Cookie.SecurePolicy = CookieSecurePolicy.Always; // HTTPS only
+        options.Cookie.HttpOnly = false; // Allow JavaScript to read for AJAX
+        options.SuppressXFrameOptionsHeader = false;
+    });
+}
+
+public void Configure(IApplicationBuilder app, IAntiforgery antiforgery)
+{
+    // Generate and send CSRF token cookie
+    app.Use(next => context =>
+    {
+        var path = context.Request.Path.Value;
+        if (string.Equals(path, "/", StringComparison.OrdinalIgnoreCase) ||
+            string.Equals(path, "/index.html", StringComparison.OrdinalIgnoreCase))
+        {
+            var tokens = antiforgery.GetAndStoreTokens(context);
+            context.Response.Cookies.Append("XSRF-TOKEN", tokens.RequestToken!,
+                new CookieOptions { HttpOnly = false, Secure = true });
+        }
+        return next(context);
+    });
+}
+
+// 2. Apply Anti-Forgery protection to controllers
+[ApiController]
+[AutoValidateAntiforgeryToken] // Automatically validates on all HTTP methods except GET, HEAD, OPTIONS, TRACE
+public class OrderController : ControllerBase
+{
+    [HttpPost("api/orders")]
+    [ValidateAntiForgeryToken] // Explicit validation
+    public async Task<IActionResult> CreateOrder([FromBody] Order order)
+    {
+        // Your order creation logic
+        return Ok(new { OrderId = order.Id });
+    }
+
+    [HttpGet("api/orders")]
+    // No validation needed for safe methods
+    public IActionResult GetOrders()
+    {
+        return Ok(new List<Order>());
+    }
+}
+
+// 3. JavaScript code to include token in AJAX requests
+/*
+// Using fetch API
+const csrfToken = document.cookie.replace(/(?:(?:^|.*;\s*)XSRF-TOKEN\s*=\s*([^;]*).*$)|^.*$/, '$1');
+
+fetch('/api/orders', {
+    method: 'POST',
+    headers: {
+        'Content-Type': 'application/json',
+        'X-XSRF-TOKEN': csrfToken
+    },
+    body: JSON.stringify(orderData)
+});
+*/
+```
+
+---
+
+### Challenge 4: Secure Password Hashing
+
+**Problem:** Store user passwords securely using modern hashing algorithms that are resistant to brute-force attacks, not weak algorithms like MD5 or SHA1.
+
+**Solution:**
+
+```csharp
+public interface IPasswordHasher
+{
+    string HashPassword(string password);
+    bool VerifyPassword(string hashedPassword, string providedPassword);
+}
+
+public class BCryptPasswordHasher : IPasswordHasher
+{
+    private readonly int _workFactor;
+
+    public BCryptPasswordHasher(int workFactor = 12)
+    {
+        _workFactor = workFactor; // Adjust based on performance requirements (10-14 is typical)
+    }
+
+    public string HashPassword(string password)
+    {
+        if (string.IsNullOrWhiteSpace(password))
+            throw new ArgumentException("Password cannot be empty");
+
+        // BCrypt automatically handles salt generation and storage
+        return BCrypt.Net.BCrypt.HashPassword(password, _workFactor);
+    }
+
+    public bool VerifyPassword(string hashedPassword, string providedPassword)
+    {
+        if (string.IsNullOrWhiteSpace(hashedPassword) || string.IsNullOrWhiteSpace(providedPassword))
+            return false;
+
+        return BCrypt.Net.BCrypt.Verify(providedPassword, hashedPassword);
+    }
+}
+
+// Alternative: Using ASP.NET Core Identity's PasswordHasher
+public class IdentityPasswordHasher : IPasswordHasher
+{
+    private readonly PasswordHasher<object> _passwordHasher = new PasswordHasher<object>();
+
+    public string HashPassword(string password)
+    {
+        return _passwordHasher.HashPassword(null, password);
+    }
+
+    public bool VerifyPassword(string hashedPassword, string providedPassword)
+    {
+        var result = _passwordHasher.VerifyHashedPassword(null, hashedPassword, providedPassword);
+        return result == PasswordVerificationResult.Success;
+    }
+}
+
+// Usage in Registration/Login
+public class AuthService
+{
+    private readonly IPasswordHasher _passwordHasher;
+    private readonly AppDbContext _context;
+
+    public AuthService(IPasswordHasher passwordHasher, AppDbContext context)
+    {
+        _passwordHasher = passwordHasher;
+        _context = context;
+    }
+
+    public async Task<User> RegisterUserAsync(string username, string password, string email)
+    {
+        // Validate password strength
+        if (password.Length < 8)
+            throw new ArgumentException("Password must be at least 8 characters long");
+
+        var hashedPassword = _passwordHasher.HashPassword(password);
+        
+        var user = new User
+        {
+            Username = username,
+            PasswordHash = hashedPassword,
+            Email = email,
+            CreatedAt = DateTime.UtcNow
+        };
+
+        _context.Users.Add(user);
+        await _context.SaveChangesAsync();
+
+        return user;
+    }
+
+    public async Task<User?> AuthenticateUserAsync(string username, string password)
+    {
+        var user = await _context.Users.FirstOrDefaultAsync(u => u.Username == username);
+        if (user == null) return null;
+
+        if (_passwordHasher.VerifyPassword(user.PasswordHash, password))
+        {
+            return user;
+        }
+
+        return null;
+    }
+}
+```
+
+---
+
+### Challenge 5: Content Security Policy (CSP) Implementation
+
+**Problem:** Prevent XSS attacks by implementing a strong Content Security Policy that restricts where resources can be loaded from and what scripts can execute.
+
+**Solution:**
+
+```csharp
+// Custom middleware to add CSP headers
+public class CspMiddleware
+{
+    private readonly RequestDelegate _next;
+    private readonly string _cspHeader;
+
+    public CspMiddleware(RequestDelegate next, IConfiguration configuration)
+    {
+        _next = next;
+        
+        // Build a strict CSP policy
+        _cspHeader = string.Join("; ", new[]
+        {
+            "default-src 'self'",
+            "script-src 'self' 'unsafe-inline' https://trusted.cdn.com", // Allow specific CDN
+            "style-src 'self' 'unsafe-inline'",
+            "img-src 'self' data: https:",
+            "font-src 'self'",
+            "connect-src 'self' https://api.trusted.com",
+            "frame-ancestors 'none'", // Prevent clickjacking
+            "form-action 'self'",
+            "base-uri 'self'",
+            "object-src 'none'"
+        });
+    }
+
+    public async Task Invoke(HttpContext context)
+    {
+        context.Response.Headers.Add("Content-Security-Policy", _cspHeader);
+        context.Response.Headers.Add("X-Content-Type-Options", "nosniff");
+        context.Response.Headers.Add("X-Frame-Options", "DENY");
+        context.Response.Headers.Add("X-XSS-Protection", "1; mode=block");
+        context.Response.Headers.Add("Referrer-Policy", "strict-origin-when-cross-origin");
+
+        await _next(context);
+    }
+}
+
+// Extension method for easy registration
+public static class CspMiddlewareExtensions
+{
+    public static IApplicationBuilder UseCsp(this IApplicationBuilder app)
+    {
+        return app.UseMiddleware<CspMiddleware>();
+    }
+}
+
+// Program.cs configuration
+public void Configure(IApplicationBuilder app, IWebHostEnvironment env)
+{
+    // Other middleware
+    app.UseCsp();
+    
+    // For reporting CSP violations (advanced)
+    app.Use(async (context, next) =>
+    {
+        if (context.Request.Path.StartsWithSegments("/csp-report"))
+        {
+            if (context.Request.Method == "POST")
+            {
+                using var reader = new StreamReader(context.Request.Body);
+                var report = await reader.ReadToEndAsync();
+                // Log the CSP violation report
+                var logger = context.RequestServices.GetService<ILogger<Program>>();
+                logger.LogWarning("CSP Violation: {Report}", report);
+            }
+            context.Response.StatusCode = 204;
+            return;
+        }
+        await next();
+    });
+}
+```
+
+---
+
+### Challenge 6: Rate Limiting and Brute-Force Protection
+
+**Problem:** Protect authentication endpoints and API resources from brute-force attacks and abuse by implementing rate limiting.
+
+**Solution:**
+
+```csharp
+// Using AspNetCoreRateLimit NuGet package
+// First: Install-Package AspNetCoreRateLimit
+
+// Program.cs configuration
+public void ConfigureServices(IServiceCollection services)
+{
+    // Rate limiting services
+    services.AddMemoryCache();
+    services.Configure<IpRateLimitOptions>(Configuration.GetSection("IpRateLimiting"));
+    services.Configure<IpRateLimitPolicies>(Configuration.GetSection("IpRateLimitPolicies"));
+    services.AddSingleton<IIpPolicyStore, MemoryCacheIpPolicyStore>();
+    services.AddSingleton<IRateLimitCounterStore, MemoryCacheRateLimitCounterStore>();
+    services.AddSingleton<IRateLimitConfiguration, RateLimitConfiguration>();
+    services.AddSingleton<IProcessingStrategy, AsyncKeyLockProcessingStrategy>();
+}
+
+public void Configure(IApplicationBuilder app)
+{
+    app.UseIpRateLimiting();
+    // Other middleware
+}
+
+// appsettings.json configuration
+/*
+{
+  "IpRateLimiting": {
+    "EnableEndpointRateLimiting": true,
+    "StackBlockedRequests": false,
+    "RealIpHeader": "X-Real-IP",
+    "ClientIdHeader": "X-ClientId",
+    "HttpStatusCode": 429,
+    "GeneralRules": [
+      {
+        "Endpoint": "POST:/api/auth/login",
+        "Period": "1m",
+        "Limit": 5
+      },
+      {
+        "Endpoint": "*:/api/*",
+        "Period": "1m",
+        "Limit": 100
+      }
+    ]
+  }
+}
+*/
+
+// Custom rate limiting for specific scenarios
+public class LoginRateLimiter
+{
+    private readonly IMemoryCache _cache;
+    private readonly ILogger<LoginRateLimiter> _logger;
+
+    public LoginRateLimiter(IMemoryCache cache, ILogger<LoginRateLimiter> logger)
+    {
+        _cache = cache;
+        _logger = logger;
+    }
+
+    public bool IsLoginAllowed(string username, string ipAddress)
+    {
+        var cacheKey = $"login_attempts_{username}_{ipAddress}";
+        var attempts = _cache.GetOrCreate(cacheKey, entry =>
+        {
+            entry.AbsoluteExpirationRelativeToNow = TimeSpan.FromMinutes(15);
+            return 0;
+        });
+
+        if (attempts >= 5) // Max 5 attempts per 15 minutes
+        {
+            _logger.LogWarning("Too many login attempts for {Username} from {IP}", username, ipAddress);
+            return false;
+        }
+
+        _cache.Set(cacheKey, attempts + 1);
+        return true;
+    }
+
+    public void ResetLoginAttempts(string username, string ipAddress)
+    {
+        var cacheKey = $"login_attempts_{username}_{ipAddress}";
+        _cache.Remove(cacheKey);
+    }
+}
+
+// Usage in AuthController
+[ApiController]
+[Route("api/[controller]")]
+public class AuthController : ControllerBase
+{
+    private readonly LoginRateLimiter _rateLimiter;
+    private readonly AuthService _authService;
+
+    [HttpPost("login")]
+    public async Task<IActionResult> Login([FromBody] LoginRequest request)
+    {
+        var ipAddress = HttpContext.Connection.RemoteIpAddress?.ToString();
+
+        if (!_rateLimiter.IsLoginAllowed(request.Username, ipAddress))
+        {
+            return StatusCode(429, "Too many login attempts. Please try again later.");
+        }
+
+        var user = await _authService.AuthenticateUserAsync(request.Username, request.Password);
+        if (user == null)
+        {
+            return Unauthorized("Invalid credentials");
+        }
+
+        _rateLimiter.ResetLoginAttempts(request.Username, ipAddress);
+        
+        var token = // Generate JWT token
+        return Ok(new { Token = token });
+    }
+}
+```
+
+---
+
+### Challenge 7: Secure File Upload Validation
+
+**Problem:** Allow file uploads while preventing malicious files from being uploaded. Validate file type, size, and content to avoid security risks.
+
+**Solution:**
+
+```csharp
+public class FileUploadService
+{
+    private readonly IWebHostEnvironment _environment;
+    private readonly ILogger<FileUploadService> _logger;
+
+    public FileUploadService(IWebHostEnvironment environment, ILogger<FileUploadService> logger)
+    {
+        _environment = environment;
+        _logger = logger;
+    }
+
+    public async Task<FileUploadResult> UploadFileAsync(IFormFile file, string userId)
+    {
+        // 1. Validate file size (max 5MB)
+        if (file.Length == 0)
+            return FileUploadResult.Failure("File is empty");
+            
+        if (file.Length > 5 * 1024 * 1024) // 5MB
+            return FileUploadResult.Failure("File size exceeds 5MB limit");
+
+        // 2. Validate file extension
+        var allowedExtensions = new[] { ".jpg", ".jpeg", ".png", ".gif", ".pdf", ".doc", ".docx" };
+        var fileExtension = Path.GetExtension(file.FileName).ToLowerInvariant();
+        
+        if (string.IsNullOrEmpty(fileExtension) || !allowedExtensions.Contains(fileExtension))
+            return FileUploadResult.Failure("Invalid file type");
+
+        // 3. Validate MIME type (additional protection)
+        var allowedMimeTypes = new[] { "image/jpeg", "image/png", "image/gif", "application/pdf", "application/msword" };
+        if (!allowedMimeTypes.Contains(file.ContentType.ToLowerInvariant()))
+            return FileUploadResult.Failure("Invalid file content type");
+
+        // 4. Validate file content (magic numbers/signature)
+        if (!await IsFileContentValidAsync(file, fileExtension))
+            return FileUploadResult.Failure("File content does not match its type");
+
+        // 5. Sanitize filename
+        var sanitizedFileName = SanitizeFileName(file.FileName);
+        var uniqueFileName = $"{Guid.NewGuid()}_{sanitizedFileName}";
+        var uploadsPath = Path.Combine(_environment.WebRootPath, "uploads", userId);
+        
+        Directory.CreateDirectory(uploadsPath);
+        var filePath = Path.Combine(uploadsPath, uniqueFileName);
+
+        // 6. Save file with restricted permissions
+        using (var stream = new FileStream(filePath, FileMode.Create, FileAccess.Write, FileShare.None))
+        {
+            await file.CopyToAsync(stream);
+        }
+
+        // 7. Set file permissions (Unix systems)
+        if (!RuntimeInformation.IsOSPlatform(OSPlatform.Windows))
+        {
+            File.SetUnixFileMode(filePath, UnixFileMode.UserRead | UnixFileMode.UserWrite);
+        }
+
+        return FileUploadResult.Success(uniqueFileName);
+    }
+
+    private async Task<bool> IsFileContentValidAsync(IFormFile file, string expectedExtension)
+    {
+        using var memoryStream = new MemoryStream();
+        await file.CopyToAsync(memoryStream);
+        memoryStream.Position = 0;
+
+        // Check file signature (magic numbers)
+        var signature = new byte[4];
+        await memoryStream.ReadAsync(signature, 0, 4);
+
+        return expectedExtension switch
+        {
+            ".jpg" or ".jpeg" => signature[0] == 0xFF && signature[1] == 0xD8,
+            ".png" => signature[0] == 0x89 && signature[1] == 0x50 && signature[2] == 0x4E && signature[3] == 0x47,
+            ".gif" => signature[0] == 0x47 && signature[1] == 0x49 && signature[2] == 0x46,
+            ".pdf" => signature[0] == 0x25 && signature[1] == 0x50 && signature[2] == 0x44 && signature[3] == 0x46,
+            _ => true // For other types, rely on extension and MIME validation
+        };
+    }
+
+    private string SanitizeFileName(string fileName)
+    {
+        var invalidChars = Path.GetInvalidFileNameChars();
+        var sanitized = new string(fileName
+            .Where(ch => !invalidChars.Contains(ch))
+            .ToArray());
+        
+        return Path.GetFileName(sanitized); // Prevent path traversal
+    }
+}
+
+public record FileUploadResult(bool Success, string? FileName, string? ErrorMessage)
+{
+    public static FileUploadResult Success(string fileName) => new(true, fileName, null);
+    public static FileUploadResult Failure(string error) => new(false, null, error);
+}
+
+// Controller
+[ApiController]
+[Authorize]
+[Route("api/[controller]")]
+public class UploadController : ControllerBase
+{
+    private readonly FileUploadService _uploadService;
+
+    [HttpPost("file")]
+    [RequestSizeLimit(5 * 1024 * 1024)] // Limit request size
+    public async Task<IActionResult> UploadFile(IFormFile file)
+    {
+        var userId = User.FindFirst(ClaimTypes.NameIdentifier)?.Value;
+        var result = await _uploadService.UploadFileAsync(file, userId);
+
+        if (!result.Success)
+            return BadRequest(result.ErrorMessage);
+
+        return Ok(new { FileName = result.FileName });
+    }
+}
+```
+
+---
+
+### Challenge 8: Secure HTTP Headers Configuration
+
+**Problem:** Implement comprehensive security headers to protect against various web vulnerabilities including XSS, clickjacking, MIME type sniffing, etc.
+
+**Solution:**
+
+```csharp
+// Custom middleware for security headers
+public class SecurityHeadersMiddleware
+{
+    private readonly RequestDelegate _next;
+    private readonly IConfiguration _configuration;
+
+    public SecurityHeadersMiddleware(RequestDelegate next, IConfiguration configuration)
+    {
+        _next = next;
+        _configuration = configuration;
+    }
+
+    public async Task Invoke(HttpContext context)
+    {
+        // Remove server identification headers
+        context.Response.Headers.Remove("Server");
+        context.Response.Headers.Remove("X-Powered-By");
+        context.Response.Headers.Remove("X-AspNet-Version");
+
+        // Add security headers
+        context.Response.Headers["X-Content-Type-Options"] = "nosniff";
+        context.Response.Headers["X-Frame-Options"] = "DENY";
+        context.Response.Headers["X-XSS-Protection"] = "1; mode=block";
+        context.Response.Headers["Referrer-Policy"] = "strict-origin-when-cross-origin";
+        context.Response.Headers["Permissions-Policy"] = "geolocation=(), microphone=(), camera=()";
+        
+        // Strict Transport Security (HSTS) - careful in development
+        if (!context.Request.IsHttps && _configuration.GetValue<bool>("UseHsts"))
+        {
+            context.Response.Headers["Strict-Transport-Security"] = "max-age=31536000; includeSubDomains";
+        }
+
+        // Feature Policy (older browsers)
+        context.Response.Headers["Feature-Policy"] = 
+            "geolocation 'none'; microphone 'none'; camera 'none'";
+
+        await _next(context);
+    }
+}
+
+// Extension method
+public static class SecurityHeadersMiddlewareExtensions
+{
+    public static IApplicationBuilder UseSecurityHeaders(this IApplicationBuilder app)
+    {
+        return app.UseMiddleware<SecurityHeadersMiddleware>();
+    }
+}
+
+// Program.cs configuration with NWebSec (alternative approach)
+// Install-Package NWebsec.AspNetCore.Middleware
+public void Configure(IApplicationBuilder app, IWebHostEnvironment env)
+{
+    app.UseXContentTypeOptions();
+    app.UseXfo(options => options.Deny());
+    app.UseXXssProtection(options => options.EnabledWithBlockMode());
+    app.UseReferrerPolicy(options => options.StrictOriginWhenCrossOrigin());
+    
+    if (!env.IsDevelopment())
+    {
+        app.UseHsts(options => options.MaxAge(365).IncludeSubdomains());
+    }
+
+    app.UseCsp(options => options
+        .DefaultSources(s => s.Self())
+        .ScriptSources(s => s.Self().CustomSources("https://trusted.cdn.com"))
+        .StyleSources(s => s.Self().UnsafeInline())
+        .ImageSources(s => s.Self().Data())
+    );
+
+    app.UseSecurityHeaders(); // Our custom middleware
+}
+```
+
+---
+
+### Challenge 9: Input Validation and Sanitization
+
+**Problem:** Prevent various injection attacks and data corruption by thoroughly validating and sanitizing all user input.
+
+**Solution:**
+
+```csharp
+// Using DataAnnotations and FluentValidation
+public class UserRegistrationDto
+{
+    [Required(ErrorMessage = "Username is required")]
+    [StringLength(50, MinimumLength = 3, ErrorMessage = "Username must be between 3-50 characters")]
+    [RegularExpression(@"^[a-zA-Z0-9_\-]+$", ErrorMessage = "Username can only contain letters, numbers, underscores, and hyphens")]
+    public string Username { get; set; }
+
+    [Required(ErrorMessage = "Email is required")]
+    [EmailAddress(ErrorMessage = "Invalid email format")]
+    public string Email { get; set; }
+
+    [Required(ErrorMessage = "Password is required")]
+    [StringLength(100, MinimumLength = 8, ErrorMessage = "Password must be at least 8 characters")]
+    [RegularExpression(@"^(?=.*[a-z])(?=.*[A-Z])(?=.*\d)(?=.*[^\da-zA-Z]).{8,}$", 
+        ErrorMessage = "Password must contain uppercase, lowercase, number, and special character")]
+    public string Password { get; set; }
+
+    [Compare("Password", ErrorMessage = "Passwords do not match")]
+    public string ConfirmPassword { get; set; }
+}
+
+// Custom validation with FluentValidation
+public class UserRegistrationValidator : AbstractValidator<UserRegistrationDto>
+{
+    public UserRegistrationValidator()
+    {
+        RuleFor(x => x.Username)
+            .NotEmpty()
+            .Length(3, 50)
+            .Matches(@"^[a-zA-Z0-9_\-]+$")
+            .WithMessage("Invalid username format");
+
+        RuleFor(x => x.Email)
+            .NotEmpty()
+            .EmailAddress()
+            .Must(BeFromAllowedDomain)
+            .WithMessage("Email domain not allowed");
+
+        RuleFor(x => x.Password)
+            .NotEmpty()
+            .MinimumLength(8)
+            .Matches("[A-Z]").WithMessage("Password must contain uppercase letter")
+            .Matches("[a-z]").WithMessage("Password must contain lowercase letter")
+            .Matches("[0-9]").WithMessage("Password must contain number")
+            .Matches("[^a-zA-Z0-9]").WithMessage("Password must contain special character");
+    }
+
+    private bool BeFromAllowedDomain(string email)
+    {
+        var allowedDomains = new[] { "gmail.com", "outlook.com", "company.com" };
+        var domain = email.Split('@').Last();
+        return allowedDomains.Contains(domain);
+    }
+}
+
+// HTML Sanitizer for user-generated content
+public class HtmlSanitizerService
+{
+    private readonly HtmlSanitizer _sanitizer;
+
+    public HtmlSanitizerService()
+    {
+        _sanitizer = new HtmlSanitizer(); // Using Ganss.XSS library
+        _sanitizer.AllowedTags.Add("div");
+        _sanitizer.AllowedTags.Add("span");
+        _sanitizer.AllowedTags.Add("br");
+        _sanitizer.AllowedTags.Add("p");
+        
+        _sanitizer.AllowedAttributes.Add("class");
+        _sanitizer.AllowedAttributes.Add("style");
+        
+        // Remove potentially dangerous attributes
+        _sanitizer.AllowedAttributes.Remove("onclick");
+        _sanitizer.AllowedAttributes.Remove("onload");
+        _sanitizer.AllowedAttributes.Remove("onerror");
+    }
+
+    public string SanitizeHtml(string input)
+    {
+        if (string.IsNullOrEmpty(input))
+            return string.Empty;
+
+        return _sanitizer.Sanitize(input);
+    }
+}
+
+// Controller with validation
+[ApiController]
+[Route("api/[controller]")]
+public class AccountController : ControllerBase
+{
+    private readonly IValidator<UserRegistrationDto> _validator;
+    private readonly HtmlSanitizerService _sanitizer;
+
+    [HttpPost("register")]
+    public async Task<IActionResult> Register([FromBody] UserRegistrationDto dto)
+    {
+        var validationResult = await _validator.ValidateAsync(dto);
+        if (!validationResult.IsValid)
+        {
+            return BadRequest(validationResult.Errors);
+        }
+
+        // Sanitize any user input that might be displayed later
+        var sanitizedUsername = _sanitizer.Sanitize(dto.Username);
+        
+        // Registration logic
+        return Ok(new { Message = "Registration successful", Username = sanitizedUsername });
+    }
+
+    [HttpPost("comment")]
+    public IActionResult PostComment([FromBody] CommentDto comment)
+    {
+        // Sanitize HTML content to prevent XSS
+        comment.Content = _sanitizer.Sanitize(comment.Content);
+        
+        // Save comment logic
+        return Ok(new { Message = "Comment posted successfully" });
+    }
+}
+```
+
+---
+
+### Challenge 10: Secure Configuration Management
+
+**Problem:** Protect sensitive configuration data like connection strings, API keys, and secrets from being exposed in source code or configuration files.
+
+**Solution:**
+
+```csharp
+// 1. Using Azure Key Vault for secret management
+public class KeyVaultConfigurationProvider : ConfigurationProvider
+{
+    private readonly SecretClient _secretClient;
+    private readonly string _prefix;
+
+    public KeyVaultConfigurationProvider(string keyVaultUrl, string prefix = "")
+    {
+        _secretClient = new SecretClient(new Uri(keyVaultUrl), new DefaultAzureCredential());
+        _prefix = prefix;
+    }
+
+    public override void Load()
+    {
+        var secrets = _secretClient.GetPropertiesOfSecrets();
+        foreach (var secret in secrets)
+        {
+            var secretName = secret.Name;
+            if (secretName.StartsWith(_prefix))
+            {
+                var key = secretName[_prefix.Length..].Replace("--", ConfigurationPath.KeyDelimiter);
+                var secretValue = _secretClient.GetSecret(secretName).Value;
+                Data[key] = secretValue.Value;
+            }
+        }
+    }
+}
+
+public class KeyVaultConfigurationSource : IConfigurationSource
+{
+    private readonly string _keyVaultUrl;
+    private readonly string _prefix;
+
+    public KeyVaultConfigurationSource(string keyVaultUrl, string prefix = "")
+    {
+        _keyVaultUrl = keyVaultUrl;
+        _prefix = prefix;
+    }
+
+    public IConfigurationProvider Build(IConfigurationBuilder builder)
+    {
+        return new KeyVaultConfigurationProvider(_keyVaultUrl, _prefix);
+    }
+}
+
+// 2. Using environment-specific configuration
+public static IHostBuilder CreateHostBuilder(string[] args) =>
+    Host.CreateDefaultBuilder(args)
+        .ConfigureAppConfiguration((context, config) =>
+        {
+            var env = context.HostingEnvironment;
+            
+            config.AddJsonFile("appsettings.json", optional: false, reloadOnChange: true)
+                  .AddJsonFile($"appsettings.{env.EnvironmentName}.json", optional: true, reloadOnChange: true);
+
+            // Development: User Secrets
+            if (env.IsDevelopment())
+            {
+                config.AddUserSecrets<Program>();
+            }
+            // Production: Azure Key Vault
+            else if (env.IsProduction())
+            {
+                var builtConfig = config.Build();
+                var keyVaultUrl = builtConfig["AzureKeyVault:Url"];
+                config.AddAzureKeyVault(new Uri(keyVaultUrl), new DefaultAzureCredential());
+            }
+
+            // Environment variables (override everything)
+            config.AddEnvironmentVariables();
+        })
+        .ConfigureWebHostDefaults(webBuilder =>
+        {
+            webBuilder.UseStartup<Startup>();
+        });
+
+// 3. Secure configuration access with options pattern
+public class DatabaseSettings
+{
+    public string ConnectionString { get; set; }
+}
+
+public class ApiSettings
+{
+    public string ApiKey { get; set; }
+    public string Secret { get; set; }
+}
+
+// Program.cs configuration
+public void ConfigureServices(IServiceCollection services)
+{
+    // Bind configuration to strongly-typed classes
+    services.Configure<DatabaseSettings>(Configuration.GetSection("Database"));
+    services.Configure<ApiSettings>(Configuration.GetSection("ExternalApi"));
+
+    // Register services with injected configuration
+    services.AddSingleton<IDatabaseService, DatabaseService>();
+    services.AddSingleton<IApiClient, ApiClient>();
+}
+
+// Service using secure configuration
+public class DatabaseService : IDatabaseService
+{
+    private readonly DatabaseSettings _settings;
+
+    public DatabaseService(IOptions<DatabaseSettings> settings)
+    {
+        _settings = settings.Value;
+    }
+
+    public IDbConnection CreateConnection()
+    {
+        // Connection string is securely loaded from configuration
+        return new SqlConnection(_settings.ConnectionString);
+    }
+}
+
+// 4. Environment variable fallback for Docker/Kubernetes
+public void ConfigureServices(IServiceCollection services)
+{
+    // Get connection string from environment variable or configuration
+    var connectionString = Environment.GetEnvironmentVariable("DB_CONNECTION_STRING") 
+                          ?? Configuration.GetConnectionString("DefaultConnection");
+    
+    services.AddDbContext<AppDbContext>(options => 
+        options.UseSqlServer(connectionString));
+}
+```
+
+These challenges cover a wide range of security concerns in ASP.NET Core applications, from authentication and authorization to input validation and secure configuration management. Implementing these solutions will significantly improve the security posture of your applications.
