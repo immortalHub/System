@@ -1,0 +1,311 @@
+Of course. Here are 10 intermediate to advanced C# ASP.NET Core code challenges focused on security, each with a problem explanation and a detailed solution.
+
+---
+
+### Challenge 1: Preventing SQL Injection with Parameterized Queries
+
+**Problem:** An application uses raw string concatenation to build SQL queries, making it vulnerable to SQL Injection attacks. An attacker could steal, modify, or delete data.
+
+**Solution:** Use Entity Framework Core (or another ORM) which inherently uses parameterized queries. If you must use ADO.NET, **always** use `SqlParameter` objects instead of string concatenation.
+
+**Implementation (The Wrong Way):**
+```csharp
+// UNSAFE - DO NOT DO THIS
+[HttpGet("unsafe")]
+public IActionResult GetUserUnsafe(string userId)
+{
+    var query = "SELECT * FROM Users WHERE UserId = '" + userId + "'";
+    // Execute the query... (Vulnerable to SQL Injection: e.g., userId = "'; DROP TABLE Users; --")
+    return Ok();
+}
+```
+
+**Implementation (The Right Way - with Dapper):**
+```csharp
+using Dapper;
+
+[HttpGet("safe")]
+public async Task<IActionResult> GetUserSafe(string userId)
+{
+    using var connection = new SqlConnection(_config.GetConnectionString("DefaultConnection"));
+    
+    // Parameterized query - Dapper automatically handles parameterization
+    var query = "SELECT * FROM Users WHERE UserId = @UserId";
+    var user = await connection.QuerySingleOrDefaultAsync<User>(query, new { UserId = userId });
+    
+    return Ok(user);
+}
+```
+**Key Takeaway:** Never concatenate user input into SQL strings. Always use parameters.
+
+---
+
+### Challenge 2: Implementing Proper Password Hashing
+
+**Problem:** Storing passwords in plain text or using weak, outdated hashing algorithms (like MD5 or SHA1) is a critical security failure.
+
+**Solution:** Use a modern, slow hashing algorithm designed for passwords, such as **bcrypt**, **PBKDF2**, or **Argon2**. ASP.NET Core Identity uses PBKDF2 by default, which is a great choice.
+
+**Implementation (Using .NET's `Rfc2898DeriveBytes` for PBKDF2):**
+```csharp
+public class CryptoService
+{
+    private const int SaltSize = 16; // 128 bits
+    private const int KeySize = 32;  // 256 bits
+    private const int Iterations = 100000; // Slow down brute-force attacks
+    private static readonly HashAlgorithmName _algorithm = HashAlgorithmName.SHA512;
+
+    public string HashPassword(string password)
+    {
+        // Generate a cryptographically random salt
+        byte[] salt = RandomNumberGenerator.GetBytes(SaltSize);
+
+        // Hash the password with the salt
+        var hash = Rfc2898DeriveBytes.Pbkdf2(
+            Encoding.UTF8.GetBytes(password),
+            salt,
+            Iterations,
+            _algorithm,
+            KeySize
+        );
+
+        // Combine salt and hash into a single string for storage
+        return $"{Convert.ToBase64String(salt)}.{Convert.ToBase64String(hash)}";
+    }
+
+    public bool VerifyPassword(string password, string storedHash)
+    {
+        // Split the stored hash into its components
+        var parts = storedHash.Split('.', 2);
+        if (parts.Length != 2)
+        {
+            throw new FormatException("Unexpected hash format.");
+        }
+
+        var salt = Convert.FromBase64String(parts[0]);
+        var key = Convert.FromBase64String(parts[1]);
+
+        // Hash the incoming password with the same salt and parameters
+        var incomingHash = Rfc2898DeriveBytes.Pbkdf2(
+            password,
+            salt,
+            Iterations,
+            _algorithm,
+            key.Length
+        );
+
+        // Use a constant-time comparison to prevent timing attacks
+        return CryptographicOperations.FixedTimeEquals(key, incomingHash);
+    }
+}
+```
+**Key Takeaway:** Use a dedicated, slow password hashing function with a unique salt per password.
+
+---
+
+### Challenge 3: Enforcing HTTPS and Security Headers
+
+**Problem:** The application is accessible over unencrypted HTTP, and it lacks critical security headers, leaving it open to man-in-the-middle attacks, clickjacking, and other vulnerabilities.
+
+**Solution:** Enforce HTTPS in production and use middleware to add critical security headers.
+
+**Implementation (In `Program.cs`):**
+```csharp
+var builder = WebApplication.CreateBuilder(args);
+
+// 1. Add HTTPS Redirection and HSTS in production
+builder.Services.AddHttpsRedirection(options =>
+{
+    options.RedirectStatusCode = StatusCodes.Status307TemporaryRedirect;
+    options.HttpsPort = 443;
+});
+
+builder.Services.AddHsts(options =>
+{
+    options.Preload = true;
+    options.IncludeSubDomains = true;
+    options.MaxAge = TimeSpan.FromDays(365);
+    // Exclude localhost for development
+    options.ExcludedHosts.Add("localhost");
+});
+
+var app = builder.Build();
+
+if (!app.Environment.IsDevelopment())
+{
+    app.UseHsts(); // Use HSTS in production only
+}
+app.UseHttpsRedirection();
+
+// 2. Add Security Headers using custom middleware or a NuGet package like NetEscapades.AspNetCore.SecurityHeaders
+app.Use(async (context, next) =>
+{
+    context.Response.Headers.Append("X-Frame-Options", "DENY"); // Prevent clickjacking
+    context.Response.Headers.Append("X-Content-Type-Options", "nosniff"); // Prevent MIME type sniffing
+    context.Response.Headers.Append("Referrer-Policy", "strict-origin-when-cross-origin");
+    context.Response.Headers.Append("X-XSS-Protection", "1; mode=block"); // Legacy browser XSS protection
+    // Content-Security-Policy is more complex and should be tailored to your app
+    await next();
+});
+
+// ... rest of the middleware configuration
+```
+**Key Takeaway:** HTTPS and security headers are your first line of defense against common web-based attacks.
+
+---
+
+### Challenge 4: Preventing Cross-Site Request Forgery (CSRF)
+
+**Problem:** The application accepts state-changing requests (POST, PUT, DELETE) without verifying they originated from the intended user, making it vulnerable to CSRF attacks.
+
+**Solution:** Use ASP.NET Core's built-in anti-forgery validation. It works by comparing a hidden form field token (`__RequestVerificationToken`) with a cookie value.
+
+**Implementation:**
+1.  **Add the ValidateAntiForgeryToken attribute to sensitive actions:**
+    ```csharp
+    [HttpPost]
+    [ValidateAntiForgeryToken] // This validates the token
+    public IActionResult TransferMoney(TransferViewModel model)
+    {
+        // ... process the transfer
+        return RedirectToAction("Index");
+    }
+    ```
+2.  **Add the anti-forgery token to your forms:**
+    ```html
+    <form method="post">
+        @Html.AntiForgeryToken() <!-- This creates the hidden input field -->
+        <!-- ... form fields ... -->
+    </form>
+    ```
+3.  **For AJAX requests, you need to send the token in a header:**
+    ```javascript
+    // Get the token value from the form
+    var token = $('input[name="__RequestVerificationToken"]').val();
+
+    $.ajax({
+        url: '/api/transfer',
+        type: 'POST',
+        headers: {
+            'RequestVerificationToken': token // Send it in a header
+        },
+        data: JSON.stringify(data),
+        contentType: 'application/json',
+        success: function(result) { /* ... */ }
+    });
+    ```
+4.  **Validate the header in your API Controller:**
+    ```csharp
+    [ApiController]
+    [Route("api/[controller]")]
+    [AutoValidateAntiforgeryToken] // Automatically validates tokens for unsafe HTTP methods
+    public class TransferController : ControllerBase
+    {
+        // ...
+    }
+    ```
+**Key Takeaway:** Always protect state-changing endpoints with anti-forgery tokens.
+
+---
+
+### Challenge 5: Securing Cookies
+
+**Problem:** Authentication cookies are created with default, insecure settings (e.g., accessible via JavaScript, sent over HTTP, not scoped to a specific domain).
+
+**Solution:** Configure cookie policies to be secure by default, especially for authentication cookies.
+
+**Implementation (In `Program.cs`):**
+```csharp
+builder.Services.ConfigureApplicationCookie(options =>
+{
+    options.Cookie.Name = "MyApp.AuthCookie";
+    options.Cookie.HttpOnly = true; // The cookie is not accessible by JavaScript
+    options.Cookie.SecurePolicy = CookieSecurePolicy.Always; // Only send over HTTPS
+    options.Cookie.SameSite = SameSiteMode.Strict; // Protect against CSRF
+    options.ExpireTimeSpan = TimeSpan.FromHours(8); // Session management
+    options.SlidingExpiration = true;
+
+    options.LoginPath = "/Identity/Account/Login";
+    options.AccessDeniedPath = "/Identity/Account/AccessDenied";
+});
+
+// Or, for a general cookie policy
+builder.Services.Configure<CookiePolicyOptions>(options =>
+{
+    options.MinimumSameSitePolicy = SameSiteMode.Strict;
+    options.HttpOnly = HttpOnlyPolicy.Always;
+    options.Secure = CookieSecurePolicy.Always;
+});
+```
+**Key Takeaway:** `HttpOnly`, `Secure`, and `SameSite` are the three pillars of a secure cookie.
+
+---
+
+### Challenge 6: Role-Based and Policy-Based Authorization
+
+**Problem:** Authorization is implemented with simple "if" statements in controllers, leading to code duplication and potential bugs where checks are forgotten.
+
+**Solution:** Use the built-in declarative authorization attributes (`[Authorize]`) with roles or custom authorization policies for more granular control.
+
+**Implementation (Basic Role Check):**
+```csharp
+[Authorize(Roles = "Administrator,FinanceManager")] // User must be in one of these roles
+[HttpPost("approve-expense/{id}")]
+public IActionResult ApproveExpense(int id)
+{
+    // ... logic
+    return Ok();
+}
+```
+
+**Implementation (Advanced Policy-Based Authorization):**
+1.  **Define a custom policy in `Program.cs`:**
+    ```csharp
+    builder.Services.AddAuthorization(options =>
+    {
+        options.AddPolicy("RequireCanEditPosts", policy =>
+            policy.RequireAuthenticatedUser()
+                  .RequireClaim("Permission", "CanEdit") // User must have this claim
+                  .RequireAssertion(context =>
+                    context.User.HasClaim(c => c.Type == "Seniority" && c.Value == "Senior") || // OR logic
+                    context.User.IsInRole("Admin")
+                  ));
+        
+        options.AddPolicy("Over18", policy =>
+            policy.Requirements.Add(new MinimumAgeRequirement(18))); // Uses a custom requirement handler
+    });
+
+    // Register the handler for the custom requirement
+    builder.Services.AddSingleton<IAuthorizationHandler, MinimumAgeHandler>();
+    ```
+2.  **Use the Policy on a Controller Action:**
+    ```csharp
+    [Authorize(Policy = "RequireCanEditPosts")]
+    [HttpPut("posts/{id}")]
+    public IActionResult EditPost(int id, Post post)
+    {
+        // User is authorized based on the complex policy logic
+        return Ok();
+    }
+    ```
+**Key Takeaway:** Move authorization logic out of your business code and into declarative policies for consistency and security.
+
+---
+
+### Challenge 7: Preventing Mass Assignment/Over-Posting
+
+**Problem:** A model is bound directly from user input, allowing an attacker to submit data for properties that should not be editable (e.g., `IsAdmin`, `Balance`).
+
+**Solution:** Use the `[Bind]` attribute to whitelist properties, or use input/view models that only contain the properties you want to be bound.
+
+**Implementation (The Vulnerable Way):**
+```csharp
+public class User
+{
+    public int Id { get; set; }
+    public string Name { get; set; }
+    public bool IsAdmin { get; set; } // Attacker could set this to true
+}
+
+[HttpPost]
+public IActionResult UpdateUser(int id, User user) // Over-post
