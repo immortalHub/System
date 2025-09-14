@@ -1,0 +1,255 @@
+Of course! Here is an intermediate-to-advanced code challenge focused on API versioning in ASP.NET Core, complete with the problem statement and a detailed solution.
+
+---
+
+### API Versioning Code Challenge
+
+#### Problem: Evolving a Public API Without Breaking Existing Clients
+
+You are the lead developer for `CompanyAPI`, a successful public API with thousands of active clients. Your team needs to release a new, improved set of endpoints for managing `User` resources. The changes are significant:
+1.  **Response Format Change:** You want to change the response schema for the `GET /users` endpoint to include more information.
+2.  **Parameter Change:** You want to change the name of a query parameter for filtering users.
+3.  **New Endpoint:** You want to add a new, more efficient way to get a single user.
+
+However, you **cannot break** the existing applications that rely on the current API behavior. You must support both the old (v1) and new (v2) versions simultaneously.
+
+**Your task is to implement API versioning in your ASP.NET Core application to support both versions cleanly.**
+
+**Existing (v1) Contract:**
+*   `GET /api/users` - Returns a list of users with `Id` and `Name`.
+*   `GET /api/users/{id}` - Returns a single user by `Id`.
+*   Uses query parameter `type` for filtering (e.g., `?type=admin`).
+
+**Desired (v2) Contract:**
+*   `GET /api/users` - Returns a list of users with `Id`, `FirstName`, `LastName`, `Email`, and `SignupDate`.
+*   `GET /api/users/{id}` - Returns a single user with the same v2 properties.
+*   `GET /api/users/{id}/profile` - A *new* endpoint that returns detailed profile information.
+*   Uses query parameter `role` for filtering instead of `type` (e.g., `?role=admin`).
+
+---
+
+### Solution: Implementing API Versioning
+
+We will use the **Microsoft.AspNetCore.Mvc.Versioning** NuGet package, which is the standard way to handle API versioning in ASP.NET Core. We'll demonstrate two common versioning strategies: **URL Path Versioning** and **Query String Versioning**.
+
+#### Step 1: Install the NuGet Package
+```bash
+Install-Package Microsoft.AspNetCore.Mvc.Versioning
+```
+
+#### Step 2: Configure API Versioning Services (Program.cs)
+```csharp
+using Microsoft.AspNetCore.Mvc.Versioning;
+
+var builder = WebApplication.CreateBuilder(args);
+
+// Add services to the container.
+builder.Services.AddControllers();
+
+// Configure API Versioning
+builder.Services.AddApiVersioning(options =>
+{
+    options.DefaultApiVersion = new ApiVersion(1, 0); // Default version
+    options.AssumeDefaultVersionWhenUnspecified = true; // If client doesn't specify, use default
+    options.ReportApiVersions = true; // Adds headers "api-supported-versions" and "api-deprecated-versions"
+    options.ApiVersionReader = ApiVersionReader.Combine(
+        new QueryStringApiVersionReader("api-version"), // Read from query string, e.g., ?api-version=2.0
+        new HeaderApiVersionReader("x-api-version"), // Read from header
+        new UrlSegmentApiVersionReader() // Read from URL path segment
+    );
+});
+
+// Optional: For Swagger/OpenAPI integration (highly recommended for versioned APIs)
+// builder.Services.AddVersionedApiExplorer(setup =>
+// {
+//     setup.GroupNameFormat = "'v'VVV";
+//     setup.SubstituteApiVersionInUrl = true;
+// });
+
+var app = builder.Build();
+
+// ... rest of middleware configuration
+app.UseAuthorization();
+app.MapControllers();
+app.Run();
+```
+
+#### Step 3: Implement the Versioned Controllers
+
+We'll create two controller classes to clearly separate the versions.
+
+**1. The Original V1 Controller (`Controllers/V1/UsersController.cs`)**
+```csharp
+using Microsoft.AspNetCore.Mvc;
+
+namespace CompanyAPI.Controllers.V1
+{
+    [ApiController]
+    [Route("api/[controller]")] // Route: /api/users
+    [ApiVersion("1.0")]
+    public class UsersController : ControllerBase
+    {
+        // GET: api/users?type=admin
+        [HttpGet]
+        public IActionResult GetUsers(string? type)
+        {
+            // Simulate data access
+            var users = new[]
+            {
+                new { Id = 1, Name = "John Doe V1" },
+                new { Id = 2, Name = "Jane Smith V1" }
+            };
+
+            // Simulate filtering based on the old parameter 'type'
+            var filteredUsers = string.IsNullOrEmpty(type) 
+                ? users 
+                : users.Where(u => u.Name.Contains(type, StringComparison.OrdinalIgnoreCase));
+
+            return Ok(filteredUsers);
+        }
+
+        // GET api/users/5
+        [HttpGet("{id}")]
+        public IActionResult GetUser(int id)
+        {
+            // Simulate getting a user
+            var user = new { Id = id, Name = $"User #{id} from V1" };
+            return Ok(user);
+        }
+    }
+}
+```
+
+**2. The New V2 Controller (`Controllers/V2/UsersController.cs`)**
+```csharp
+using Microsoft.AspNetCore.Mvc;
+
+namespace CompanyAPI.Controllers.V2
+{
+    [ApiController]
+    [Route("api/[controller]")] // Route will be /api/users but differentiated by version
+    [ApiVersion("2.0")]
+    public class UsersController : ControllerBase
+    {
+        // GET: api/users?role=admin&api-version=2.0
+        [HttpGet]
+        public IActionResult GetUsers(string? role)
+        {
+            // Simulate new data model
+            var users = new[]
+            {
+                new { Id = 1, FirstName = "John", LastName = "Doe", Email = "john@v2.com", SignupDate = DateTime.Now.AddDays(-10) },
+                new { Id = 2, FirstName = "Jane", LastName = "Smith", Email = "jane@v2.com", SignupDate = DateTime.Now.AddDays(-5) }
+            };
+
+            // Simulate filtering based on the new parameter 'role'
+            var filteredUsers = string.IsNullOrEmpty(role)
+                ? users
+                : users.Where(u => u.LastName.Contains(role, StringComparison.OrdinalIgnoreCase));
+
+            return Ok(filteredUsers);
+        }
+
+        // GET api/users/5?api-version=2.0
+        [HttpGet("{id}")]
+        public IActionResult GetUser(int id)
+        {
+            // Return new data model
+            var user = new { Id = id, FirstName = "John", LastName = "Doe", Email = "john@v2.com", SignupDate = DateTime.Now.AddDays(-10) };
+            return Ok(user);
+        }
+
+        // NEW ENDPOINT: GET api/users/5/profile?api-version=2.0
+        [HttpGet("{id}/profile")]
+        public IActionResult GetUserProfile(int id)
+        {
+            // This endpoint only exists in V2
+            var profile = new { UserId = id, Bio = "This is a detailed profile available only in V2 API.", Website = "https://example.com" };
+            return Ok(profile);
+        }
+    }
+}
+```
+
+#### Step 4: (Advanced) Using a Single Controller with Versioned Actions
+Alternatively, you can keep both versions in a single controller, which is useful for small changes. This demonstrates the `MapToApiVersion` attribute.
+
+**`Controllers/UsersController.cs`**
+```csharp
+using Microsoft.AspNetCore.Mvc;
+
+namespace CompanyAPI.Controllers
+{
+    [ApiController]
+    [Route("api/[controller]")]
+    [ApiVersion("1.0")]
+    [ApiVersion("2.0")]
+    public class UsersController : ControllerBase
+    {
+        // V1 ENDPOINT: GET api/users?type=admin
+        [HttpGet, MapToApiVersion("1.0")]
+        public IActionResult GetUsersV1(string? type)
+        {
+            var users = new[] { new { Id = 1, Name = "John Doe V1" } };
+            return Ok(users);
+        }
+
+        // V2 ENDPOINT: GET api/users?role=admin&api-version=2.0
+        [HttpGet, MapToApiVersion("2.0")]
+        public IActionResult GetUsersV2(string? role)
+        {
+            var users = new[] { new { Id = 1, FirstName = "John", LastName = "Doe" } };
+            return Ok(users);
+        }
+
+        // This action is shared across both versions but returns different models based on the version.
+        // GET api/users/5
+        [HttpGet("{id}")]
+        public IActionResult GetUser(int id)
+        {
+            if (HttpContext.GetRequestedApiVersion()?.MajorVersion == 2)
+            {
+                // Return V2 model
+                var userV2 = new { Id = id, FirstName = "John", LastName = "Doe" };
+                return Ok(userV2);
+            }
+            // Return V1 model
+            var userV1 = new { Id = id, Name = "John Doe V1" };
+            return Ok(userV1);
+        }
+
+        // V2-ONLY ENDPOINT: GET api/users/5/profile
+        [HttpGet("{id}/profile"), MapToApiVersion("2.0")]
+        public IActionResult GetUserProfile(int id)
+        {
+            var profile = new { UserId = id, Bio = "Detailed profile." };
+            return Ok(profile);
+        }
+    }
+}
+```
+
+### Testing the Versioned API
+
+With this setup, clients can access different versions in multiple ways:
+
+1.  **Via Query String (Default):**
+    *   `GET /api/users?api-version=1.0` -> V1 Response
+    *   `GET /api/users?api-version=2.0` -> V2 Response
+    *   `GET /api/users/5/profile?api-version=2.0` -> V2 Profile Endpoint
+
+2.  **Via URL Path Segment (Requires changing the `[Route]` attribute):**
+    *   Change the V2 controller's route to `[Route("api/v{version:apiVersion}/[controller]")]`
+    *   Then call: `GET /api/v2/users` -> V2 Response
+    *   This is a very common and clear approach.
+
+3.  **Via HTTP Header:**
+    *   Add a header `x-api-version: 2.0` to your request.
+    *   `GET /api/users` -> V2 Response (if the header is present).
+
+The `ReportApiVersions` option will add helpful headers to the response, informing clients which versions are available and which is deprecated:
+```
+api-supported-versions: 1.0, 2.0
+```
+
+This implementation successfully allows your API to evolve without breaking existing clients, satisfying the requirements of the challenge.
