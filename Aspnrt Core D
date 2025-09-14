@@ -1,0 +1,813 @@
+Of course! Here are 10 C# ASP.NET code challenges focused on durability, ranging from intermediate to advanced levels. Each challenge includes a problem explanation and a solution implementation.
+
+---
+
+### Challenge 1: Retry Pattern with Exponential Backoff
+
+**Problem:** An external HTTP service is occasionally unreliable and throws transient errors (like 5xx status codes or timeouts). You need to call this service in a way that automatically retries failed requests with an exponentially increasing delay between attempts to avoid overwhelming the service and to allow it to recover.
+
+**Solution:** Implement a method that wraps an HTTP call with retry logic using a `Polly` policy.
+
+```csharp
+using Polly;
+using Polly.Retry;
+
+public class ResilientApiService
+{
+    private readonly IHttpClientFactory _httpClientFactory;
+    private readonly AsyncRetryPolicy<HttpResponseMessage> _retryPolicy;
+    private readonly ILogger<ResilientApiService> _logger;
+
+    public ResilientApiService(IHttpClientFactory httpClientFactory, ILogger<ResilientApiService> logger)
+    {
+        _httpClientFactory = httpClientFactory;
+        _logger = logger;
+
+        // Define the retry policy with exponential backoff
+        _retryPolicy = Policy
+            .HandleResult<HttpResponseMessage>(r =>
+                (int)r.StatusCode >= 500 || r.StatusCode == System.Net.HttpStatusCode.RequestTimeout) // Transient error conditions
+            .Or<HttpRequestException>() // Network errors
+            .WaitAndRetryAsync(
+                retryCount: 5,
+                sleepDurationProvider: (retryAttempt) => TimeSpan.FromSeconds(Math.Pow(2, retryAttempt)), // Exponential backoff: 2, 4, 8, 16, 32 sec
+                onRetry: (outcome, timespan, retryAttempt, context) =>
+                {
+                    _logger.LogWarning(outcome.Exception,
+                        "Retry {RetryAttempt} after {TimeSpanSeconds} seconds due to: {ExceptionMessage}",
+                        retryAttempt, timespan.TotalSeconds, outcome.Exception?.Message ?? outcome.Result?.StatusCode.ToString());
+                });
+    }
+
+    public async Task<HttpResponseMessage> GetDataFromUnreliableApiAsync(string requestUri, CancellationToken cancellationToken = default)
+    {
+        var client = _httpClientFactory.CreateClient("ResilientClient");
+        
+        // Use the policy to execute the HTTP call
+        return await _retryPolicy.ExecuteAsync(async () =>
+        {
+            var response = await client.GetAsync(requestUri, cancellationToken);
+            // You can also check the response content here for more granular error handling
+            return response;
+        });
+    }
+}
+// Registration in Startup.cs / Program.cs
+// services.AddHttpClient("ResilientClient");
+// services.AddScoped<ResilientApiService>();
+```
+
+---
+
+### Challenge 2: Circuit Breaker Pattern
+
+**Problem:** To prevent a cascade of failures and allow a failing service time to recover, you need to stop making requests for a period of time after a certain number of consecutive failures. This is the Circuit Breaker pattern.
+
+**Solution:** Combine Polly's Circuit Breaker and Retry policies to create a robust resilience strategy.
+
+```csharp
+using Polly;
+using Polly.CircuitBreaker;
+using Polly.Wrap;
+
+public class CircuitBreakerApiService
+{
+    private readonly AsyncPolicyWrap<HttpResponseMessage> _resiliencePolicy;
+    private readonly ILogger<CircuitBreakerApiService> _logger;
+
+    public CircuitBreakerApiService(ILogger<CircuitBreakerApiService> logger)
+    {
+        _logger = logger;
+
+        // 1. Define the Circuit Breaker policy
+        var circuitBreakerPolicy = Policy
+            .HandleResult<HttpResponseMessage>(r => (int)r.StatusCode >= 500)
+            .Or<HttpRequestException>()
+            .CircuitBreakerAsync(
+                handledEventsAllowedBeforeBreaking: 3, // Break after 3 consecutive failures
+                durationOfBreak: TimeSpan.FromSeconds(30), // Stay broken for 30 seconds
+                onBreak: (outcome, breakDelay, context) => // Called when the circuit breaks
+                {
+                    _logger.LogError(outcome.Exception, "Circuit breaker opened! Will not attempt for {BreakDelaySeconds} seconds.", breakDelay.TotalSeconds);
+                },
+                onReset: (context) => // Called when the circuit resets
+                {
+                    _logger.LogInformation("Circuit breaker reset.");
+                },
+                onHalfOpen: () => // Called before allowing a test call after the break duration
+                {
+                    _logger.LogInformation("Circuit breaker half-open. Testing if service is healthy...");
+                }
+            );
+
+        // 2. Define a simple retry policy for transient errors that occur when the circuit is closed
+        var retryPolicy = Policy
+            .HandleResult<HttpResponseMessage>(r => (int)r.StatusCode >= 500)
+            .Or<HttpRequestException>()
+            .RetryAsync(2, onRetry: (outcome, retryCount, context) =>
+            {
+                _logger.LogWarning("Retrying attempt {RetryCount}", retryCount);
+            });
+
+        // 3. Wrap the policies: First, the request is covered by the circuit breaker.
+        //    If the circuit is closed, the retry policy will execute inside it.
+        _resiliencePolicy = Policy.WrapAsync(retryPolicy, circuitBreakerPolicy);
+    }
+
+    public async Task<HttpResponseMessage> GetProtectedResourceAsync(string requestUri)
+    {
+        var client = new HttpClient(); // In real life, use IHttpClientFactory
+        return await _resiliencePolicy.ExecuteAsync(() => client.GetAsync(requestUri));
+    }
+}
+```
+
+---
+
+### Challenge 3: Durable Background Task Queue
+
+**Problem:** You need to queue background work (e.g., sending emails, processing uploads) that must be completed even if the web application restarts or crashes. An in-memory queue is lost on restart.
+
+**Solution:** Implement a queue that uses a database (Entity Framework Core) to persist work items. A background service (`IHostedService`) dequeues and processes them.
+
+```csharp
+// 1. Define a model for the queue item
+public class BackgroundTask
+{
+    public Guid Id { get; set; } = Guid.NewGuid();
+    public string TaskType { get; set; } // e.g., "SendEmail", "ProcessImage"
+    public string Data { get; set; } // Serialized parameters (e.g., JSON)
+    public DateTime CreatedAt { get; set; } = DateTime.UtcNow;
+    public DateTime? ProcessedAt { get; set; }
+    public string? Error { get; set; }
+}
+
+// 2. Define the queue interface
+public interface IDurableTaskQueue
+{
+    Task QueueWorkItemAsync<T>(string taskType, T data);
+    Task<BackgroundTask?> DequeueAsync(CancellationToken cancellationToken);
+    Task MarkAsCompleteAsync(Guid taskId);
+    Task MarkAsFailedAsync(Guid taskId, string error);
+}
+
+// 3. Implement the queue using EF Core
+public class DatabaseTaskQueue : IDurableTaskQueue, IHostedService, IDisposable
+{
+    private readonly IServiceProvider _serviceProvider; // For creating a scoped DbContext
+    private readonly ILogger<DatabaseTaskQueue> _logger;
+    private Timer? _timer;
+    private readonly Channel<BackgroundTask> _processingChannel; // In-memory channel for dequeued items
+
+    public DatabaseTaskQueue(IServiceProvider serviceProvider, ILogger<DatabaseTaskQueue> logger)
+    {
+        _serviceProvider = serviceProvider;
+        _logger = logger;
+        // Create a bounded channel to hold dequeued items for processing
+        _processingChannel = Channel.CreateBounded<BackgroundTask>(new BoundedChannelOptions(100)
+        {
+            FullMode = BoundedChannelFullMode.Wait
+        });
+    }
+
+    public async Task QueueWorkItemAsync<T>(string taskType, T data)
+    {
+        using var scope = _serviceProvider.CreateScope();
+        var dbContext = scope.ServiceProvider.GetRequiredService<AppDbContext>();
+        
+        var serializedData = System.Text.Json.JsonSerializer.Serialize(data);
+        var task = new BackgroundTask
+        {
+            TaskType = taskType,
+            Data = serializedData
+        };
+        
+        dbContext.BackgroundTasks.Add(task);
+        await dbContext.SaveChangesAsync();
+        _logger.LogInformation("Queued task {TaskId} of type {TaskType}", task.Id, taskType);
+    }
+
+    public async Task<BackgroundTask?> DequeueAsync(CancellationToken cancellationToken)
+    {
+        // This will be called by the processing loop
+        return await _processingChannel.Reader.ReadAsync(cancellationToken);
+    }
+
+    // --- IHostedService Methods (The Processing Loop) ---
+    public Task StartAsync(CancellationToken cancellationToken)
+    {
+        _logger.LogInformation("Durable Task Queue is starting.");
+        // Use a timer to periodically check the database for new work
+        _timer = new Timer(ProcessQueue, null, TimeSpan.Zero, TimeSpan.FromSeconds(30));
+        // Start a background task to process items from the channel
+        _ = Task.Run(() => ProcessItemsFromChannel(cancellationToken), cancellationToken);
+        return Task.CompletedTask;
+    }
+
+    private async void ProcessQueue(object? state)
+    {
+        try
+        {
+            using var scope = _serviceProvider.CreateScope();
+            var dbContext = scope.ServiceProvider.GetRequiredService<AppDbContext>();
+
+            // Find the oldest unprocessed task
+            var taskToProcess = await dbContext.BackgroundTasks
+                .Where(t => t.ProcessedAt == null)
+                .OrderBy(t => t.CreatedAt)
+                .FirstOrDefaultAsync();
+
+            if (taskToProcess != null)
+            {
+                // Write it to the channel for the processor to pick up
+                await _processingChannel.Writer.WriteAsync(taskToProcess);
+            }
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "Error occurred while processing task queue.");
+        }
+    }
+
+    private async Task ProcessItemsFromChannel(CancellationToken cancellationToken)
+    {
+        await foreach (var task in _processingChannel.Reader.ReadAllAsync(cancellationToken))
+        {
+            try
+            {
+                _logger.LogInformation("Processing task {TaskId} of type {TaskType}", task.Id, task.TaskType);
+                // TODO: Based on task.TaskType, resolve a handler (e.g., via DI) and execute it with task.Data
+                // Example: if (task.TaskType == "SendEmail") { ... }
+
+                // Simulate work
+                await Task.Delay(2000, cancellationToken);
+
+                await MarkAsCompleteAsync(task.Id);
+                _logger.LogInformation("Completed task {TaskId}", task.Id);
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "Error processing task {TaskId}", task.Id);
+                await MarkAsFailedAsync(task.Id, ex.Message);
+            }
+        }
+    }
+
+    public async Task MarkAsCompleteAsync(Guid taskId)
+    {
+        using var scope = _serviceProvider.CreateScope();
+        var dbContext = scope.ServiceProvider.GetRequiredService<AppDbContext>();
+        var task = await dbContext.BackgroundTasks.FindAsync(taskId);
+        if (task != null)
+        {
+            task.ProcessedAt = DateTime.UtcNow;
+            await dbContext.SaveChangesAsync();
+        }
+    }
+
+    public async Task MarkAsFailedAsync(Guid taskId, string error)
+    {
+        using var scope = _serviceProvider.CreateScope();
+        var dbContext = scope.ServiceProvider.GetRequiredService<AppDbContext>();
+        var task = await dbContext.BackgroundTasks.FindAsync(taskId);
+        if (task != null)
+        {
+            task.Error = error;
+            await dbContext.SaveChangesAsync();
+        }
+    }
+
+    public Task StopAsync(CancellationToken cancellationToken)
+    {
+        _logger.LogInformation("Durable Task Queue is stopping.");
+        _timer?.Change(Timeout.Infinite, 0);
+        _processingChannel.Writer.Complete(); // Signal the channel reader to stop
+        return Task.CompletedTask;
+    }
+    public void Dispose() => _timer?.Dispose();
+}
+// Registration
+// services.AddDbContext<AppDbContext>();
+// services.AddSingleton<IDurableTaskQueue, DatabaseTaskQueue>();
+// services.AddHostedService(provider => (DatabaseTaskQueue)provider.GetRequiredService<IDurableTaskQueue>());
+```
+
+---
+
+### Challenge 4: Resilient Entity Framework Core Execution
+
+**Problem:** Database operations can fail due to transient errors like connection timeouts or deadlocks. Your application should handle these gracefully by retrying the operation.
+
+**Solution:** Use Polly to create an execution strategy wrapper for EF Core operations, similar to its built-in strategy but with more control.
+
+```csharp
+public class ResilientExecutionStrategy
+{
+    private readonly AsyncRetryPolicy _retryPolicy;
+    private readonly ILogger<ResilientExecutionStrategy> _logger;
+
+    // Common transient SQL Server errors (example)
+    private readonly int[] _sqlTransientErrorNumbers = { 4060, 40197, 40501, 40613, 49918, 49919, 49920, 11001, 208, 18456, 1204, 1205, 1222 };
+
+    public ResilientExecutionStrategy(ILogger<ResilientExecutionStrategy> logger)
+    {
+        _logger = logger;
+        _retryPolicy = Policy
+            .Handle<SqlException>(ex => _sqlTransientErrorNumbers.Contains(ex.Number))
+            .Or<TimeoutException>()
+            .Or<HttpRequestException>() // Could happen if using Azure SQL
+            .WaitAndRetryAsync(
+                retryCount: 3,
+                sleepDurationProvider: attempt => TimeSpan.FromSeconds(Math.Pow(2, attempt)), // Exponential backoff
+                onRetry: (exception, delay, attempt, context) =>
+                {
+                    _logger.LogWarning(exception,
+                        "Retry attempt {Attempt} after {DelaySeconds}s due to: {Error}",
+                        attempt, delay.TotalSeconds, exception.Message);
+                });
+    }
+
+    public async Task<T> ExecuteAsync<T>(Func<Task<T>> action, CancellationToken cancellationToken = default)
+    {
+        // Execute the action within the retry policy
+        return await _retryPolicy.ExecuteAsync(action);
+    }
+
+    // Example usage within a service
+    public async Task<int> UpdateUserEmailResilientlyAsync(AppDbContext dbContext, Guid userId, string newEmail)
+    {
+        return await ExecuteAsync(async () =>
+        {
+            var user = await dbContext.Users.FindAsync(userId);
+            if (user == null) return 0;
+
+            user.Email = newEmail;
+            return await dbContext.SaveChangesAsync();
+        });
+    }
+}
+```
+
+---
+
+### Challenge 5: Distributed Lock with Redis
+
+**Problem:** In a multi-instance web farm, you need to ensure a piece of code (e.g., a scheduled task, resource mutation) is only executed by one instance at a time to prevent race conditions and duplicate processing.
+
+**Solution:** Implement a distributed lock using Redis and the RedLock algorithm pattern. We'll use the `RedLock.net` library for a robust solution.
+
+```csharp
+// First, install the RedLock.net NuGet package
+// Using statements for RedLock.net
+using RedLockNet;
+using RedLockNet.SERedis;
+using RedLockNet.SERedis.Configuration;
+using StackExchange.Redis;
+
+public interface IDistributedLockFactory
+{
+    Task<IRedLock> CreateLockAsync(string resource, TimeSpan expiryTime);
+}
+
+public class RedisDistributedLockFactory : IDistributedLockFactory, IAsyncDisposable
+{
+    private readonly RedLockFactory _redLockFactory;
+    private readonly ILogger<RedisDistributedLockFactory> _logger;
+
+    public RedisDistributedLockFactory(IConfiguration configuration, ILogger<RedisDistributedLockFactory> logger)
+    {
+        _logger = logger;
+        var redisConnectionString = configuration.GetConnectionString("Redis");
+        // Create a connection to one or more Redis endpoints
+        var multiplexer = ConnectionMultiplexer.Connect(redisConnectionString);
+        var endPoints = new List<RedLockEndPoint> { new RedLockMultiplexer(multiplexer) };
+        _redLockFactory = RedLockFactory.Create(endPoints);
+    }
+
+    public async Task<IRedLock> CreateLockAsync(string resource, TimeSpan expiryTime)
+    {
+        // The wait and retry times are set to zero for simplicity in this example.
+        // In a real scenario, you might want to wait a short time to acquire the lock.
+        return await _redLockFactory.CreateLockAsync(
+            resource, // The name of the resource to lock
+            expiryTime,
+            TimeSpan.Zero, // Wait time to acquire the lock
+            TimeSpan.Zero  // Retry time between acquisition attempts
+        );
+    }
+
+    public async ValueTask DisposeAsync()
+    {
+        await _redLockFactory.DisposeAsync();
+    }
+}
+
+// Usage in a service to perform an exclusive action
+public class ExclusiveResourceService
+{
+    private readonly IDistributedLockFactory _lockFactory;
+    private readonly ILogger<ExclusiveResourceService> _logger;
+
+    public ExclusiveResourceService(IDistributedLockFactory lockFactory, ILogger<ExclusiveResourceService> logger)
+    {
+        _lockFactory = lockFactory;
+        _logger = logger;
+    }
+
+    public async Task PerformExclusiveActionAsync()
+    {
+        var resource = "exclusive:action:key";
+        var expiry = TimeSpan.FromSeconds(30);
+
+        // Attempt to acquire the lock
+        await using (var redLock = await _lockFactory.CreateLockAsync(resource, expiry))
+        {
+            if (redLock.IsAcquired)
+            {
+                _logger.LogInformation("Lock acquired for {Resource}. Performing exclusive action.", resource);
+                // Perform your thread-safe/process-safe work here
+                await Task.Delay(5000); // Simulate work
+                _logger.LogInformation("Exclusive action complete. Lock will be released.");
+            }
+            else
+            {
+                _logger.LogWarning("Could not acquire lock for {Resource}. Another instance is likely processing it.", resource);
+            }
+        } // The lock is automatically released via Dispose/DisposeAsync
+    }
+}
+// Registration
+// services.AddSingleton<IDistributedLockFactory, RedisDistributedLockFactory>();
+// services.AddScoped<ExclusiveResourceService>();
+```
+
+---
+
+### Challenge 6: Fallback Strategy for Critical Operations
+
+**Problem:** For a non-critical feature that depends on an unreliable external service, you need a plan B. If the primary service call fails, the application should use a cached value or a default behavior instead of showing an error.
+
+**Solution:** Implement a Fallback pattern using Polly, which provides a alternative result or action when the primary one fails.
+
+```csharp
+using Polly;
+using Polly.Fallback;
+
+public class FallbackApiService
+{
+    private readonly AsyncFallbackPolicy<WeatherForecast> _fallbackPolicy;
+    private readonly IMemoryCache _cache;
+    private readonly ILogger<FallbackApiService> _logger;
+
+    public FallbackApiService(IMemoryCache cache, ILogger<FallbackApiService> logger)
+    {
+        _cache = cache;
+        _logger = logger;
+
+        // Define the fallback policy
+        _fallbackPolicy = Policy<WeatherForecast>
+            .Handle<HttpRequestException>() // Or any exception you want to handle
+            .OrResult(result => result == null) // Also handle null results
+            .FallbackAsync(
+                fallbackAction: (cancelToken, context) => GetCachedWeatherAsync(), // The fallback method
+                onFallbackAsync: (outcome, context) => // Called when the fallback is triggered
+                {
+                    _logger.LogWarning(outcome.Exception, "Primary weather API failed. Using cached fallback data.");
+                    return Task.CompletedTask;
+                }
+            );
+    }
+
+    public async Task<WeatherForecast> GetWeatherWithFallbackAsync(string city)
+    {
+        // Wrap the primary call with the fallback policy
+        return await _fallbackPolicy.ExecuteAsync(async () =>
+        {
+            // This is the primary, potentially failing, operation
+            return await GetWeatherFromPrimaryApiAsync(city);
+        });
+    }
+
+    private async Task<WeatherForecast> GetWeatherFromPrimaryApiAsync(string city)
+    {
+        // Simulate an unreliable API call
+        var shouldFail = Random.Shared.Next(0, 2) == 0; // 50% chance of failure
+        if (shouldFail)
+        {
+            throw new HttpRequestException("Primary API is unavailable.");
+        }
+
+        await Task.Delay(100); // Simulate network delay
+        var freshForecast = new WeatherForecast { City = city, TemperatureC = 22, Summary = "Sunny" };
+        
+        // Cache the fresh result for potential future fallback use
+        _cache.Set($"weather_{city}", freshForecast, TimeSpan.FromMinutes(10));
+        
+        return freshForecast;
+    }
+
+    private Task<WeatherForecast> GetCachedWeatherAsync()
+    {
+        // Try to get the last good result from cache
+        var cachedForecast = _cache.Get<WeatherForecast>("weather_london");
+        if (cachedForecast != null)
+        {
+            return Task.FromResult(cachedForecast);
+        }
+        // Ultimate fallback: a hardcoded default
+        return Task.FromResult(new WeatherForecast { City = "London", TemperatureC = 15, Summary = "Cloudy" });
+    }
+}
+
+public class WeatherForecast
+{
+    public string City { get; set; }
+    public int TemperatureC { get; set; }
+    public string Summary { get; set; }
+}
+```
+
+---
+
+### Challenge 7: Bulkhead Isolation
+
+**Problem:** A failure in one part of the application (e.g., a slow external service call) should not consume all resources (like threads) and cause the entire application to become unresponsive. You need to isolate these operations.
+
+**Solution:** Use Polly's Bulkhead policy to limit the number of concurrent executions of a specific set of operations.
+
+```csharp
+using Polly.Bulkhead;
+
+public class IsolatedApiService
+{
+    private readonly AsyncBulkheadPolicy _bulkheadPolicy;
+    private readonly ILogger<IsolatedApiService> _logger;
+
+    public IsolatedApiService(ILogger<IsolatedApiService> logger)
+    {
+        _logger = logger;
+
+        // Create a bulkhead policy that allows a maximum of 4 concurrent executions
+        // and queues up to 2 additional actions if the max parallelism is reached.
+        _bulkheadPolicy = Policy.BulkheadAsync(
+            maxParallelization: 4,
+            maxQueuingActions: 2,
+            onBulkheadRejectedAsync: (context) => // Called if the queue is also full
+            {
+                _logger.LogWarning("Bulkhead rejected execution. Limit reached.");
+                return Task.CompletedTask;
+            });
+    }
+
+    public async Task<string> CallIsolatedServiceAsync(int requestId)
+    {
+        // Execute the call within the bulkhead isolation
+        return await _bulkheadPolicy.ExecuteAsync(async () =>
+        {
+            _logger.LogInformation("Bulkhead: Executing request {RequestId}.", requestId);
+            // Simulate a call to a slow or unreliable service
+            await Task.Delay(TimeSpan.FromSeconds(5));
+            return $"Processed request {requestId}";
+        });
+    }
+}
+
+// Usage in a Controller
+[ApiController]
+[Route("api/[controller]")]
+public class BulkheadController : ControllerBase
+{
+    private readonly IsolatedApiService _service;
+    public BulkheadController(IsolatedApiService service) => _service = service;
+
+    [HttpGet("{id}")]
+    public async Task<IActionResult> Get(int id)
+    {
+        var result = await _service.CallIsolatedServiceAsync(id);
+        return Ok(result);
+    }
+}
+// Simulate load: Launch 10 simultaneous requests. Only 4 will execute immediately,
+// 2 will be queued, and 4 will be rejected with a logged warning.
+```
+
+---
+
+### Challenge 8: Timeout Policy
+
+**Problem:** To prevent waiting indefinitely for a non-responsive service and free up resources, you need to abort operations that exceed a reasonable time limit.
+
+**Solution:** Wrap the operation in a Polly Timeout policy.
+
+```csharp
+using Polly.Timeout;
+
+public class TimeoutApiService
+{
+    private readonly AsyncTimeoutPolicy _timeoutPolicy;
+    private readonly ILogger<TimeoutApiService> _logger;
+
+    public TimeoutApiService(ILogger<TimeoutApiService> logger)
+    {
+        _logger = logger;
+
+        _timeoutPolicy = Policy.TimeoutAsync(
+            timeout: TimeSpan.FromSeconds(3), // Timeout after 3 seconds
+            timeoutStrategy: TimeoutStrategy.Optimistic, // Uses CancellationToken
+            onTimeoutAsync: (context, timespan, task, exception) =>
+            {
+                _logger.LogWarning("Operation timed out after {TimeSpanSeconds} seconds.", timespan.TotalSeconds);
+                return Task.CompletedTask;
+            });
+    }
+
+    public async Task<string> CallServiceWithTimeoutAsync()
+    {
+        try
+        {
+            return await _timeoutPolicy.ExecuteAsync(async (ct) =>
+            {
+                _logger.LogInformation("Starting potentially long-running operation...");
+                // Simulate a task that might hang (e.g., 10 seconds)
+                await Task.Delay(TimeSpan.FromSeconds(10), ct);
+                return "Success";
+            }, CancellationToken.None); // Polly will provide its own linked CancellationToken
+        }
+        catch (TimeoutRejectedException ex)
+        {
+            // This will be thrown after 3 seconds
+            _logger.LogError(ex, "A timeout occurred.");
+            return "Operation timed out.";
+        }
+    }
+}
+```
+
+---
+
+### Challenge 9: Combining Resilience Policies (Wrap)
+
+**Problem:** You need to protect an operation with multiple resilience strategies: Timeout, Retry, and Circuit Breaker. These policies need to be combined in a specific order.
+
+**Solution:** Use Polly's `PolicyWrap` to combine individual policies into a single, cohesive strategy.
+
+```csharp
+public class SuperResilientApiService
+{
+    private readonly AsyncPolicyWrap _resiliencePipeline;
+    private readonly ILogger<SuperResilientApiService> _logger;
+
+    public SuperResilientApiService(ILogger<SuperResilientApiService> logger)
+    {
+        _logger = logger;
+
+        // 1. Define individual policies
+        var retryPolicy = Policy
+            .Handle<TimeoutRejectedException>() // Retry on timeout
+            .Or<HttpRequestException>()
+            .WaitAndRetryAsync(
+                2,
+                retryAttempt => TimeSpan.FromSeconds(Math.Pow(2, retryAttempt)),
+                onRetry: (exception, delay, attempt, context) =>
+                {
+                    _logger.LogWarning(exception, "Retry attempt {Attempt} after {DelayMs}ms", attempt, delay.TotalMilliseconds);
+                });
+
+        var circuitBreakerPolicy = Policy
+            .Handle<HttpRequestException>()
+            .Or<TimeoutRejectedException>()
+            .CircuitBreakerAsync(
+                3,
+                TimeSpan.FromSeconds(15),
+                onBreak: (exception, breakDelay, context) =>
+                {
+                    _logger.LogError(exception, "Circuit broken! Pausing for {DelayMs}ms", breakDelay.TotalMilliseconds);
+                },
+                onReset: (context) => { _logger.LogInformation("Circuit reset."); });
+
+        var timeoutPolicy = Policy
+            .TimeoutAsync(TimeSpan.FromSeconds(4), TimeoutStrategy.Optimistic);
+
+        // 2. Combine them in a specific order.
+        // The order is outer -> inner: Timeout (Wrap) -> CircuitBreaker (Wrap) -> Retry.
+        // This means: First, the retry policy will execute. Inside each retry, the circuit breaker will govern the call.
+        // Inside the circuit breaker, the timeout will be applied to the individual execution.
+        _resiliencePipeline = Policy.WrapAsync(retryPolicy, circuitBreakerPolicy, timeoutPolicy);
+    }
+
+    public async Task<string> GetDataAsync()
+    {
+        return await _resiliencePipeline.ExecuteAsync(async () =>
+        {
+            _logger.LogInformation("Executing within the resilience pipeline.");
+            var client = new HttpClient { Timeout = TimeSpan.FromSeconds(10) }; // Base timeout longer than Polly's
+            // This call is protected by the combined policy wrap
+            var response = await client.GetStringAsync("https://unreliable-api.example.com/data");
+            return response;
+        });
+    }
+}
+```
+
+---
+
+### Challenge 10: Application Health Checks with Liveness and Readiness
+
+**Problem:** In a containerized environment (e.g., Kubernetes), your application needs to report its health status. Liveness probes restart unhealthy containers, while readiness probes stop traffic to containers that are alive but not ready to handle requests (e.g., waiting for a dependency).
+
+**Solution:** Implement ASP.NET Core Health Checks with custom checks for critical dependencies.
+
+```csharp
+// 1. Create a custom health check for a critical database
+public class DatabaseHealthCheck : IHealthCheck
+{
+    private readonly AppDbContext _dbContext;
+    public DatabaseHealthCheck(AppDbContext dbContext) => _dbContext = dbContext;
+
+    public async Task<HealthCheckResult> CheckHealthAsync(
+        HealthCheckContext context,
+        CancellationToken cancellationToken = default)
+    {
+        try
+        {
+            // A simple query to check database connectivity
+            _ = await _dbContext.Users.AnyAsync(cancellationToken);
+            return HealthCheckResult.Healthy("Database is responsive.");
+        }
+        catch (Exception ex)
+        {
+            return HealthCheckResult.Unhealthy("Database is unreachable.", ex);
+        }
+    }
+}
+
+// 2. Create a health check for an external API
+public class ExternalApiHealthCheck : IHealthCheck
+{
+    private readonly HttpClient _httpClient;
+    public ExternalApiHealthCheck(HttpClient httpClient) => _httpClient = httpClient;
+
+    public async Task<HealthCheckResult> CheckHealthAsync(
+        HealthCheckContext context,
+        CancellationToken cancellationToken = default)
+    {
+        try
+        {
+            var response = await _httpClient.GetAsync("health", cancellationToken);
+            return response.IsSuccessStatusCode
+                ? HealthCheckResult.Healthy("External API is responsive.")
+                : HealthCheckResult.Degraded($"External API returned status: {response.StatusCode}");
+        }
+        catch (Exception ex)
+        {
+            return HealthCheckResult.Unhealthy("External API is unreachable.", ex);
+        }
+    }
+}
+
+// 3. Register health checks in Startup.cs / Program.cs
+public void ConfigureServices(IServiceCollection services)
+{
+    // ... other services
+
+    services.AddHealthChecks()
+        .AddCheck<DatabaseHealthCheck>("database", failureStatus: HealthStatus.Unhealthy, tags: new[] { "ready", "live" }) // Critical for both
+        .AddCheck<ExternalApiHealthCheck>("external-api", failureStatus: HealthStatus.Degraded, tags: new[] { "ready" }) // Only affects readiness
+        .AddCheck("self", () => HealthCheckResult.Healthy(), tags: new[] { "live" }); // Simple liveness check
+
+    services.AddHttpClient<ExternalApiHealthCheck>(); // Register HttpClient for the health check
+}
+
+public void Configure(IApplicationBuilder app, IWebHostEnvironment env)
+{
+    // ... other middleware
+
+    // Map the health check endpoints
+    app.UseEndpoints(endpoints =>
+    {
+        // Liveness probe: Is the app running?
+        endpoints.MapHealthChecks("/health/live", new HealthCheckOptions
+        {
+            Predicate = (check) => check.Tags.Contains("live")
+        });
+
+        // Readiness probe: Is the app ready to receive requests?
+        endpoints.MapHealthChecks("/health/ready", new HealthCheckOptions
+        {
+            Predicate = (check) => check.Tags.Contains("ready")
+        });
+
+        // Combined health check for general monitoring
+        endpoints.MapHealthChecks("/health");
+    });
+}
+// Kubernetes deployment YAML would then reference these endpoints:
+// livenessProbe:
+//   httpGet:
+//     path: /health/live
+//     port: 80
+// readinessProbe:
+//   httpGet:
+//     path: /health/ready
+//     port: 80
+```
